@@ -1,0 +1,89 @@
+name: Self-host deploy (Cloud Run)
+
+# Builds backend + pusher from this fork and deploys them to your own GCP
+# project. Configure the repo variables listed in selfhost/gcp-bootstrap.sh's
+# output before the first run (Settings -> Secrets and variables -> Actions
+# -> Variables): GCP_PROJECT_ID, GCP_REGION, GCP_WIF_PROVIDER, GCP_DEPLOY_SA,
+# GCP_RUNTIME_SA, PINECONE_INDEX_NAME, REDIS_DB_HOST, REDIS_DB_PORT.
+
+on:
+  push:
+    branches: [custom]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write # required for Workload Identity Federation
+
+env:
+  AR_REPO: omi
+  PYTHON_BASE_IMAGE: python:3.11-slim # public stand-in for BasedHardware's private base image
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${{ vars.GCP_REGION }}-docker.pkg.dev" --quiet
+
+      - name: Build & push pusher image
+        run: |
+          IMG="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ env.AR_REPO }}/pusher:${{ github.sha }}"
+          docker build --platform linux/amd64 \
+            --build-arg PYTHON_BASE_IMAGE=${{ env.PYTHON_BASE_IMAGE }} \
+            -f backend/pusher/Dockerfile -t "$IMG" .
+          docker push "$IMG"
+          echo "PUSHER_IMAGE=$IMG" >> "$GITHUB_ENV"
+
+      - name: Build & push backend image
+        run: |
+          IMG="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ env.AR_REPO }}/backend:${{ github.sha }}"
+          docker build --platform linux/amd64 \
+            --build-arg PYTHON_BASE_IMAGE=${{ env.PYTHON_BASE_IMAGE }} \
+            -f backend/Dockerfile -t "$IMG" .
+          docker push "$IMG"
+          echo "BACKEND_IMAGE=$IMG" >> "$GITHUB_ENV"
+
+      - name: Deploy pusher
+        id: deploy_pusher
+        run: |
+          gcloud run deploy omi-pusher \
+            --image="${{ env.PUSHER_IMAGE }}" \
+            --project="${{ vars.GCP_PROJECT_ID }}" \
+            --region="${{ vars.GCP_REGION }}" \
+            --service-account="${{ vars.GCP_RUNTIME_SA }}" \
+            --no-cpu-throttling --timeout=3600 --memory=1Gi --cpu=1 \
+            --min-instances=0 --max-instances=2 \
+            --allow-unauthenticated \
+            --set-env-vars="MEMORY_ENABLED=on,FIREBASE_PROJECT_ID=${{ vars.GCP_PROJECT_ID }},FIREBASE_AUTH_PROJECT_ID=${{ vars.GCP_PROJECT_ID }},BUCKET_SPEECH_PROFILES=${{ vars.GCP_PROJECT_ID }}-speech-profiles,BUCKET_BACKUPS=${{ vars.GCP_PROJECT_ID }}-backups,BUCKET_PLUGINS_LOGOS=${{ vars.GCP_PROJECT_ID }}-plugin-logos,BUCKET_FRAME_REQUESTS=${{ vars.GCP_PROJECT_ID }}-frame-requests,BUCKET_FRAME_REQUESTS_TEMPORARY=${{ vars.GCP_PROJECT_ID }}-frame-requests-temp,PINECONE_INDEX_NAME=${{ vars.PINECONE_INDEX_NAME }},REDIS_DB_HOST=${{ vars.REDIS_DB_HOST }},REDIS_DB_PORT=${{ vars.REDIS_DB_PORT }}" \
+            --set-secrets="OPENAI_API_KEY=OPENAI_API_KEY:latest,DEEPGRAM_API_KEY=DEEPGRAM_API_KEY:latest,PINECONE_API_KEY=PINECONE_API_KEY:latest,REDIS_DB_PASSWORD=REDIS_DB_PASSWORD:latest,ENCRYPTION_SECRET=ENCRYPTION_SECRET:latest,ADMIN_KEY=ADMIN_KEY:latest"
+          echo "PUSHER_URL=$(gcloud run services describe omi-pusher --project=${{ vars.GCP_PROJECT_ID }} --region=${{ vars.GCP_REGION }} --format='value(status.url)')" >> "$GITHUB_ENV"
+
+      - name: Deploy backend
+        run: |
+          gcloud run deploy omi-backend \
+            --image="${{ env.BACKEND_IMAGE }}" \
+            --project="${{ vars.GCP_PROJECT_ID }}" \
+            --region="${{ vars.GCP_REGION }}" \
+            --service-account="${{ vars.GCP_RUNTIME_SA }}" \
+            --no-cpu-throttling --timeout=3600 --memory=1Gi --cpu=1 \
+            --min-instances=0 --max-instances=4 \
+            --allow-unauthenticated \
+            --set-env-vars="FIREBASE_PROJECT_ID=${{ vars.GCP_PROJECT_ID }},FIREBASE_AUTH_PROJECT_ID=${{ vars.GCP_PROJECT_ID }},HOSTED_PUSHER_API_URL=${{ env.PUSHER_URL }},BUCKET_SPEECH_PROFILES=${{ vars.GCP_PROJECT_ID }}-speech-profiles,BUCKET_BACKUPS=${{ vars.GCP_PROJECT_ID }}-backups,BUCKET_PLUGINS_LOGOS=${{ vars.GCP_PROJECT_ID }}-plugin-logos,BUCKET_FRAME_REQUESTS=${{ vars.GCP_PROJECT_ID }}-frame-requests,BUCKET_FRAME_REQUESTS_TEMPORARY=${{ vars.GCP_PROJECT_ID }}-frame-requests-temp,PINECONE_INDEX_NAME=${{ vars.PINECONE_INDEX_NAME }},REDIS_DB_HOST=${{ vars.REDIS_DB_HOST }},REDIS_DB_PORT=${{ vars.REDIS_DB_PORT }}" \
+            --set-secrets="OPENAI_API_KEY=OPENAI_API_KEY:latest,DEEPGRAM_API_KEY=DEEPGRAM_API_KEY:latest,PINECONE_API_KEY=PINECONE_API_KEY:latest,REDIS_DB_PASSWORD=REDIS_DB_PASSWORD:latest,ENCRYPTION_SECRET=ENCRYPTION_SECRET:latest,ADMIN_KEY=ADMIN_KEY:latest"
+          BACKEND_URL="$(gcloud run services describe omi-backend --project=${{ vars.GCP_PROJECT_ID }} --region=${{ vars.GCP_REGION }} --format='value(status.url)')"
+          # Second pass: backend needs to know its own public URL.
+          gcloud run services update omi-backend \
+            --project="${{ vars.GCP_PROJECT_ID }}" --region="${{ vars.GCP_REGION }}" \
+            --set-env-vars="BASE_API_URL=$BACKEND_URL,API_BASE_URL=$BACKEND_URL"
+          echo "Backend deployed at: $BACKEND_URL"
