@@ -22,12 +22,18 @@ logger = logging.getLogger(__name__)
 # SDK boundary. Downstream callers narrow results via the adapter pattern.
 _redis_host: Optional[str] = os.getenv('REDIS_DB_HOST')
 _redis_port_env: Optional[str] = os.getenv('REDIS_DB_PORT')
+# Self-host addition: managed Redis providers reachable over the public
+# internet (e.g. Upstash) enforce TLS on their standard endpoint, unlike the
+# internal/VPC-only Redis this codebase otherwise assumes. Off by default so
+# BasedHardware's own deployments (which never set this) are unaffected.
+_redis_ssl: bool = os.getenv('REDIS_DB_SSL', '').strip().lower() in ('1', 'true', 'yes')
 r: Any = redis.Redis(
     host=cast(str, _redis_host),
     port=int(_redis_port_env) if _redis_port_env is not None else 6379,
     username='default',
     password=os.getenv('REDIS_DB_PASSWORD'),
     health_check_interval=30,
+    ssl=_redis_ssl,
 )
 
 # Longer than the 10-minute max approval TTL (contract §5) plus clock-skew
@@ -726,6 +732,7 @@ async def get_async_redis_client() -> Any:
             username='default',
             password=os.getenv('REDIS_DB_PASSWORD'),
             decode_responses=True,
+            ssl=_redis_ssl,
         )
     return _async_redis_client
 

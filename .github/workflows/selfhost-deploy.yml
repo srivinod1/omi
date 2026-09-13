@@ -82,8 +82,10 @@ jobs:
             --set-env-vars="FIREBASE_PROJECT_ID=${{ vars.GCP_PROJECT_ID }},FIREBASE_AUTH_PROJECT_ID=based-hardware-dev,HOSTED_PUSHER_API_URL=${{ env.PUSHER_URL }},BUCKET_SPEECH_PROFILES=${{ vars.GCP_PROJECT_ID }}-speech-profiles,BUCKET_BACKUPS=${{ vars.GCP_PROJECT_ID }}-backups,BUCKET_PLUGINS_LOGOS=${{ vars.GCP_PROJECT_ID }}-plugin-logos,BUCKET_FRAME_REQUESTS=${{ vars.GCP_PROJECT_ID }}-frame-requests,BUCKET_FRAME_REQUESTS_TEMPORARY=${{ vars.GCP_PROJECT_ID }}-frame-requests-temp,PINECONE_INDEX_NAME=${{ vars.PINECONE_INDEX_NAME }},REDIS_DB_HOST=${{ vars.REDIS_DB_HOST }},REDIS_DB_PORT=${{ vars.REDIS_DB_PORT }}" \
             --set-secrets="OPENAI_API_KEY=OPENAI_API_KEY:latest,DEEPGRAM_API_KEY=DEEPGRAM_API_KEY:latest,PINECONE_API_KEY=PINECONE_API_KEY:latest,REDIS_DB_PASSWORD=REDIS_DB_PASSWORD:latest,ENCRYPTION_SECRET=ENCRYPTION_SECRET:latest,ADMIN_KEY=ADMIN_KEY:latest"
           BACKEND_URL="$(gcloud run services describe omi-backend --project=${{ vars.GCP_PROJECT_ID }} --region=${{ vars.GCP_REGION }} --format='value(status.url)')"
-          # Second pass: backend needs to know its own public URL.
+          # Second pass: backend needs to know its own public URL. Use
+          # --update-env-vars (merge), NOT --set-env-vars (replace) — the
+          # latter wipes every other env var set in the first deploy above.
           gcloud run services update omi-backend \
             --project="${{ vars.GCP_PROJECT_ID }}" --region="${{ vars.GCP_REGION }}" \
-            --set-env-vars="BASE_API_URL=$BACKEND_URL,API_BASE_URL=$BACKEND_URL"
+            --update-env-vars="BASE_API_URL=$BACKEND_URL,API_BASE_URL=$BACKEND_URL"
           echo "Backend deployed at: $BACKEND_URL"
