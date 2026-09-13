@@ -36,8 +36,30 @@ echo "=== Project: $PROJECT_ID  Region: $REGION  Repo: $GITHUB_REPO@$GITHUB_BRAN
 read -r -p "This will create real, potentially billable GCP resources. Continue? [y/N] " CONFIRM
 [[ "$CONFIRM" == "y" || "$CONFIRM" == "Y" ]] || { echo "Aborted."; exit 1; }
 
-echo "==> Creating project..."
-gcloud projects create "$PROJECT_ID" --name="$PROJECT_NAME"
+# Retries a flaky command a few times with backoff. New projects/service
+# accounts take a few seconds to propagate through IAM, and Cloud Resource
+# Manager / Artifact Registry calls right after project creation routinely
+# 403/404 until that catches up.
+retry() {
+  local attempt=1 max=6 delay=5
+  until "$@"; do
+    if (( attempt >= max )); then
+      echo "  Giving up after $attempt attempts: $*" >&2
+      return 1
+    fi
+    echo "  Retrying in ${delay}s (attempt $((attempt+1))/$max)..." >&2
+    sleep "$delay"
+    attempt=$((attempt+1))
+    delay=$((delay+5))
+  done
+}
+
+if gcloud projects describe "$PROJECT_ID" >/dev/null 2>&1; then
+  echo "==> Project $PROJECT_ID already exists, reusing it."
+else
+  echo "==> Creating project..."
+  gcloud projects create "$PROJECT_ID" --name="$PROJECT_NAME"
+fi
 
 echo "==> Linking billing..."
 gcloud billing projects link "$PROJECT_ID" --billing-account="$BILLING_ACCOUNT_ID"
@@ -64,9 +86,11 @@ gcloud firestore databases create --location="$REGION" --type=firestore-native |
   echo "  (already exists? continuing)"
 
 echo "==> Creating Artifact Registry repo..."
-gcloud artifacts repositories create "$AR_REPO" \
-  --repository-format=docker --location="$REGION" \
-  --description="Omi self-host images" || echo "  (already exists? continuing)"
+if ! gcloud artifacts repositories describe "$AR_REPO" --location="$REGION" >/dev/null 2>&1; then
+  retry gcloud artifacts repositories create "$AR_REPO" \
+    --repository-format=docker --location="$REGION" \
+    --description="Omi self-host images"
+fi
 
 echo "==> Creating GCS buckets..."
 for suffix in speech-profiles backups plugin-logos frame-requests frame-requests-temp; do
@@ -75,29 +99,35 @@ for suffix in speech-profiles backups plugin-logos frame-requests frame-requests
 done
 
 echo "==> Creating runtime service account ($RUNTIME_SA_EMAIL)..."
-gcloud iam service-accounts create "$RUNTIME_SA_ID" \
-  --display-name="Omi backend/pusher Cloud Run runtime" || echo "  (already exists? continuing)"
+if ! gcloud iam service-accounts describe "$RUNTIME_SA_EMAIL" >/dev/null 2>&1; then
+  gcloud iam service-accounts create "$RUNTIME_SA_ID" \
+    --display-name="Omi backend/pusher Cloud Run runtime"
+  retry gcloud iam service-accounts describe "$RUNTIME_SA_EMAIL" >/dev/null
+fi
 
 for role in roles/datastore.user roles/secretmanager.secretAccessor roles/logging.logWriter roles/monitoring.metricWriter; do
-  gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  retry gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:${RUNTIME_SA_EMAIL}" --role="$role" --condition=None >/dev/null
 done
 
 echo "==> Granting bucket access to runtime SA..."
 for suffix in speech-profiles backups plugin-logos frame-requests frame-requests-temp; do
-  gsutil iam ch "serviceAccount:${RUNTIME_SA_EMAIL}:roles/storage.objectAdmin" "gs://${PROJECT_ID}-${suffix}"
+  retry gsutil iam ch "serviceAccount:${RUNTIME_SA_EMAIL}:roles/storage.objectAdmin" "gs://${PROJECT_ID}-${suffix}"
 done
 
 echo "==> Creating GitHub Actions deploy service account ($DEPLOY_SA_EMAIL)..."
-gcloud iam service-accounts create "$DEPLOY_SA_ID" \
-  --display-name="GitHub Actions deployer for Omi self-host" || echo "  (already exists? continuing)"
+if ! gcloud iam service-accounts describe "$DEPLOY_SA_EMAIL" >/dev/null 2>&1; then
+  gcloud iam service-accounts create "$DEPLOY_SA_ID" \
+    --display-name="GitHub Actions deployer for Omi self-host"
+  retry gcloud iam service-accounts describe "$DEPLOY_SA_EMAIL" >/dev/null
+fi
 
 for role in roles/run.admin roles/artifactregistry.writer; do
-  gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  retry gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:${DEPLOY_SA_EMAIL}" --role="$role" --condition=None >/dev/null
 done
 # Let the deployer act as the runtime SA when deploying Cloud Run revisions.
-gcloud iam service-accounts add-iam-policy-binding "$RUNTIME_SA_EMAIL" \
+retry gcloud iam service-accounts add-iam-policy-binding "$RUNTIME_SA_EMAIL" \
   --member="serviceAccount:${DEPLOY_SA_EMAIL}" --role="roles/iam.serviceAccountUser"
 
 echo "==> Setting up Workload Identity Federation for GitHub Actions..."
@@ -114,7 +144,7 @@ gcloud iam workload-identity-pools providers create-oidc "$WIF_PROVIDER_ID" \
 PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"
 WIF_POOL_RESOURCE="projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${WIF_POOL_ID}"
 
-gcloud iam service-accounts add-iam-policy-binding "$DEPLOY_SA_EMAIL" \
+retry gcloud iam service-accounts add-iam-policy-binding "$DEPLOY_SA_EMAIL" \
   --role="roles/iam.workloadIdentityUser" \
   --member="principalSet://iam.googleapis.com/${WIF_POOL_RESOURCE}/attribute.repository/${GITHUB_REPO}"
 
@@ -139,11 +169,7 @@ Bootstrap done. Save this — you'll need it for GitHub Actions and deploys:
 
 Next steps:
 
-1. Enable Firebase on this project (needed for Firebase Auth):
-   https://console.firebase.google.com/ -> Add project -> select "$PROJECT_ID"
-   (Google Analytics not required — skip it if asked.)
-
-2. Fill in the real secret values (never paste these into chat):
+1. Fill in the real secret values (never paste these into chat):
      echo -n "sk-...."      | gcloud secrets versions add OPENAI_API_KEY --data-file=-
      echo -n "...."         | gcloud secrets versions add DEEPGRAM_API_KEY --data-file=-
      echo -n "...."         | gcloud secrets versions add PINECONE_API_KEY --data-file=-
@@ -151,14 +177,17 @@ Next steps:
      openssl rand -hex 32   | gcloud secrets versions add ENCRYPTION_SECRET --data-file=-
      openssl rand -hex 16   | gcloud secrets versions add ADMIN_KEY --data-file=-
 
-3. In your GitHub repo (srivinod1/omi) settings -> Secrets and variables -> Actions,
+2. In your GitHub repo (srivinod1/omi) settings -> Secrets and variables -> Actions,
    add these repository VARIABLES (not secrets — they're not sensitive):
      GCP_PROJECT_ID       = $PROJECT_ID
      GCP_REGION            = $REGION
      GCP_WIF_PROVIDER     = $WIF_PROVIDER_RESOURCE
      GCP_DEPLOY_SA        = $DEPLOY_SA_EMAIL
      GCP_RUNTIME_SA       = $RUNTIME_SA_EMAIL
+     PINECONE_INDEX_NAME  = <your Pinecone index name>
+     REDIS_DB_HOST        = <your Upstash host>
+     REDIS_DB_PORT        = <your Upstash port, usually 6379>
 
-4. Push to the 'custom' branch to trigger .github/workflows/selfhost-deploy.yml.
+3. Push to the 'custom' branch to trigger .github/workflows/selfhost-deploy.yml.
 ================================================================================
 EOF

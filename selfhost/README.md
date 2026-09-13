@@ -32,9 +32,18 @@ internal microservices:
 | `omi-backend` | `backend/` (`backend/Dockerfile`) | Main API the app/device talks to (`BASE_API_URL`) |
 | `omi-pusher`  | `backend/pusher/` (`backend/pusher/Dockerfile`) | Finalizes conversations after a listen session ends. Required — without it, conversations stay stuck "in_progress". |
 
-Both use: **Firestore** (DB) + **Firebase Auth** (users) + **Cloud Storage**
-(audio/speech-profile buckets) + **Secret Manager** (credentials), all in your
-own GCP project, plus these external hosted services (bring your own keys):
+Both use: **Firestore** (DB) + **Cloud Storage** (audio/speech-profile
+buckets) + **Secret Manager** (credentials), all in your own GCP project, plus
+these external hosted services (bring your own keys):
+
+**Auth note:** we're using the official Omi app unmodified, just pointed at
+this backend via its developer-mode `BASE_API_URL` setting. Its users still
+sign in through BasedHardware's own Firebase project (`based-hardware-dev`) —
+that's baked into the app binary. Our backend only *verifies* those tokens
+(`FIREBASE_AUTH_PROJECT_ID=based-hardware-dev`, which needs no credentials —
+token verification is just checking a public signature) and stores the
+resulting data in our own project (`FIREBASE_PROJECT_ID`). No Firebase Auth
+setup, sign-in providers, or app registration needed on our own project.
 
 - **OpenAI** — LLM calls
 - **Deepgram** — speech-to-text
@@ -58,12 +67,11 @@ all optional and off by default.
    project, enables APIs, Firestore, buckets, Artifact Registry, service
    accounts, Workload Identity Federation for GitHub Actions, and empty
    Secret Manager entries.
-3. **Firebase** — enable Firebase on the project via the console (needed for
-   Firebase Auth token verification); see the bootstrap script's printed
-   instructions.
-4. **Secrets** — fill in the Secret Manager entries the bootstrap script
+3. **Secrets** — fill in the Secret Manager entries the bootstrap script
    created, with your real API keys.
-5. **Deploy** — push to `custom`; GitHub Actions (`.github/workflows/selfhost-deploy.yml`)
+4. **Deploy** — push to `custom`; GitHub Actions (`.github/workflows/selfhost-deploy.yml`)
    builds both images and deploys them to Cloud Run.
-6. **Point the app at it** — set `BASE_API_URL` in the Omi mobile/desktop app
-   to your Cloud Run `omi-backend` URL.
+5. **Point the app at it** — in the official Omi app, enable developer mode
+   and set `BASE_API_URL` to your Cloud Run `omi-backend` URL. Sign-in still
+   goes through BasedHardware's Firebase project; only API calls route to
+   your backend.
